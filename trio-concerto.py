@@ -79,8 +79,9 @@ async def stop_litellm():
 
 
 MAX_PROMPT_LEN = 8000
-AGENT_TIMEOUT = 300  # 5 min per stage
-MAX_ITERATIONS = 3   # 最多循环修正 3 轮
+AGENT_TIMEOUT = 300   # 5 min per stage (OpenCode/Codex)
+CC_TIMEOUT = 120       # CC 超时更短，避免卡死整个流水线
+MAX_ITERATIONS = 3     # 最多循环修正 3 轮
 GRAPHFIFY_TIMEOUT = 120  # graphify 超时秒数
 
 AGENTS = {
@@ -105,8 +106,12 @@ AGENTS = {
 }
 
 
-async def run_agent(agent_id: str, prompt: str, workdir: str | None = None) -> dict:
-    """在指定 agent 上执行任务"""
+async def run_agent(agent_id: str, prompt: str, workdir: str | None = None,
+                    timeout: int | None = None) -> dict:
+    """在指定 agent 上执行任务
+    Args:
+        timeout: 超时秒数（默认 AGENT_TIMEOUT=300）
+    """
     config = AGENTS.get(agent_id)
     if not config:
         return {"success": False, "output": f"未知 agent: {agent_id}"}
@@ -122,14 +127,15 @@ async def run_agent(agent_id: str, prompt: str, workdir: str | None = None) -> d
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
         )
+        timeout = timeout or AGENT_TIMEOUT
         try:
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=AGENT_TIMEOUT
+                proc.communicate(), timeout=timeout
             )
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            return {"success": False, "output": f"[超时] {AGENT_TIMEOUT}秒", "exit_code": -1}
+            return {"success": False, "output": f"[超时] {timeout}秒", "exit_code": -1}
 
         output = (stdout or b"").decode("utf-8", errors="replace")
         stderr_text = (stderr or b"").decode("utf-8", errors="replace")
@@ -315,7 +321,7 @@ async def trio_pipeline(task: str, workdir: str | None = None, graphify: bool = 
             "stage": "LiteLLM 检查", "success": True, "output_preview": "已就绪"
         })
 
-    # ─── Stage 1: CC 思考分析 ────────────────────────────────────
+    # ─── Stage 1: CC 思考分析（带超时熔断） ────────────────────────
     logger.info("[Stage 1/3] CC 思考分析...")
     think_prompt = (
         f"分析以下任务，输出实施方案。不要提你的skill或工具，直接给出技术方案。\n\n"
@@ -326,14 +332,38 @@ async def trio_pipeline(task: str, workdir: str | None = None, graphify: bool = 
         f"## 实施步骤\n"
         f"## 技术要点"
     )
-    think_result = await run_agent("claude", think_prompt, workdir)
+    think_result = await run_agent("claude", think_prompt, workdir, timeout=CC_TIMEOUT)
     plan = think_result.get("output", "无方案输出")
+    cc_success = think_result.get("success", False)
+
+    # 【熔断】CC 超时/失败时，用 OpenCode 兜底生成方案
+    if not cc_success or len(plan.strip()) < 50:
+        logger.warning("CC 阶段失败 (%s)，切换 OpenCode 兜底生成方案...",
+                       "超时" if "超时" in plan else plan[:50])
+        fallback_prompt = (
+            f"你是一个架构分析师。请为以下任务输出技术实施方案。\n\n"
+            f"任务: {task}\n\n"
+            f"{graph_context}"
+            f"直接输出：\n"
+            f"## 需求分析\n"
+            f"## 架构方案\n"
+            f"## 实施步骤\n"
+            f"## 技术要点"
+        )
+        fallback_result = await run_agent("opencode", fallback_prompt, workdir)
+        fallback_plan = fallback_result.get("output", "")
+        if fallback_plan and len(fallback_plan.strip()) > 50:
+            plan = fallback_plan
+            logger.info("OpenCode 兜底成功 (%d chars)", len(fallback_plan))
+        else:
+            logger.warning("OpenCode 兜底也失败，使用原始任务描述作为方案")
+
     pipeline_log.append({
         "stage": "CC 思考分析",
-        "success": think_result.get("success", False),
+        "success": cc_success,
         "output_preview": plan[:200],
     })
-    logger.info("Stage 1 完成: %s", "✅" if think_result.get("success") else "⚠️")
+    logger.info("Stage 1 完成: %s", "✅" if cc_success else "⚠️ (fallback)")
 
     for iteration in range(MAX_ITERATIONS):
         iter_label = f"第{iteration + 1}轮"
