@@ -253,7 +253,7 @@ async def run_graphify(workdir: str) -> dict:
                 "pipeline_log_entry": pipeline_log_entry}
 
 
-async def trio_pipeline(task: str, workdir: str | None = None, graphify: bool = False, review_only: bool = False) -> dict:
+async def trio_pipeline(task: str, workdir: str | None = None, graphify: bool = False) -> dict:
     """
     三体协奏流水线:
     1. CC 思考分析 → 输出方案
@@ -338,57 +338,48 @@ async def trio_pipeline(task: str, workdir: str | None = None, graphify: bool = 
     for iteration in range(MAX_ITERATIONS):
         iter_label = f"第{iteration + 1}轮"
         logger.info("─" * 40)
-        logger.info("[Stage 2/3] %s...", iter_label)
+        logger.info("[Stage 2/3] %s OpenCode 编码执行...", iter_label)
 
-        # ─── 审查模式: 跳过编码，直接 CC→Codex ───────────────────
-        if review_only:
-            logger.info("审查模式: 跳过编码，直接审查")
-            code_output = plan  # 用 CC 的方案作为审查对象
-            best_code_output = plan
-
-            pipeline_log.append({
-                "stage": f"OpenCode 编码 ({iter_label})",
-                "success": True,
-                "output_preview": "审查模式：跳过",
-            })
+        # 把代码落地到临时文件，供后续 agent 读取
+        code_path = os.path.join(workdir or "/tmp", ".trio_code_output.py")
+        if iteration > 0 and best_code_output:
+            prev_code_snippet = best_code_output[:2000]
         else:
-            # 把代码落地到临时文件，供后续 agent 读取
-            code_path = os.path.join(workdir or "/tmp", ".trio_code_output.py")
-            if iteration > 0 and best_code_output:
-                # 上一轮的代码已存在，传给 OpenCode 让它增量修改
-                prev_code_snippet = best_code_output[:2000]
-            else:
-                prev_code_snippet = ""
+            prev_code_snippet = ""
 
-            # ─── Stage 2: OpenCode 编码实现 ───────────────────────
+        # ─── Stage 2: OpenCode 编码实现/修复 ──────────────────────
+        # 根据任务类型和修正轮次自动调整 prompt
+        if iteration > 0 and prev_code_snippet:
+            # 修正轮：基于上一轮代码 + 审核反馈做增量修改
             code_prompt = (
-                f"根据以下方案和任务进行编码实现。\n\n"
+                f"根据以下方案、任务和审核反馈，修改代码。\n\n"
                 f"{graph_context}"
                 f"## 实施方案\n{plan}\n"
                 f"## 任务\n{task}\n"
-                f"\n重要：请直接在回复中输出完整的最终代码（用 markdown 代码块包裹），不要只写文件路径。\n"
+                f"\n## 上一轮生成的代码\n"
+                f"```python\n{prev_code_snippet}\n```\n"
+                f"\n## 上一轮审核反馈\n"
+                f"{review_feedback}\n\n"
+                f"请在上一轮代码基础上修改。如果是审查类任务，请直接修改项目中的源文件；"
+                f"如果是编码类任务，请输出最终代码。\n"
             )
-            if iteration > 0 and prev_code_snippet:
-                code_prompt += (
-                    f"\n## 上一轮生成的代码\n"
-                    f"```python\n{prev_code_snippet}\n```\n"
-                    f"\n## 上一轮审核反馈\n"
-                    f"{review_feedback}\n\n"
-                    f"请在上一轮代码基础上修改，仅输出最终代码，不要带解释。\n"
-                )
-            elif iteration > 0:
-                code_prompt += (
-                    f"\n## 上一轮审核反馈\n"
-                    f"{review_feedback}\n\n"
-                    f"请根据反馈修正代码，仅输出最终代码，不要带解释。\n"
-                )
+        else:
+            # 首轮：根据方案从零开始
+            code_prompt = (
+                f"根据以下方案和任务进行编码实现或代码修复。\n\n"
+                f"{graph_context}"
+                f"## 实施方案\n{plan}\n"
+                f"## 任务\n{task}\n"
+                f"\n如果是审查/评审类任务，请直接修改项目源文件修复发现的问题；"
+                f"如果是编码类任务，请输出最终代码（用 markdown 代码块包裹）。\n"
+            )
 
-            code_result = await run_agent("opencode", code_prompt, workdir)
-            code_output = code_result.get("output", "无代码输出")
-            best_code_output = code_output
+        code_result = await run_agent("opencode", code_prompt, workdir)
+        code_output = code_result.get("output", "无代码输出")
+        best_code_output = code_output
 
-            # 将代码写入临时文件，供后续审核和修正使用
-            code_path = os.path.join(workdir or "/tmp", ".trio_code_output.py")
+        # 将代码写入临时文件，供后续审核和修正使用
+        code_path = os.path.join(workdir or "/tmp", ".trio_code_output.py")
         try:
             # 从 markdown 代码块中提取纯代码
             import re
@@ -485,18 +476,15 @@ mcp = MCPServer("trio-concerto")
 
 
 @mcp.tool()
-async def trio_concerto(task: str, workdir: str | None = None, graphify: bool = False, review_only: bool = False) -> str:
+async def trio_concerto(task: str, workdir: str | None = None, graphify: bool = False) -> str:
     """三体协奏 — 三 agent 流水线执行任务
 
-    Hermes 调度 → CC(思考分析) → OpenCode(编码执行) → Codex(审核验证)
-
-    review_only=True 时跳过 OpenCode 编码，直接 CC→Codex 做代码审查。
+    Hermes 调度 → CC(思考分析) → OpenCode(编码执行/修复) → Codex(审核验证)
 
     Args:
         task: 任务描述，需要清晰完整的需求说明
         workdir: 工作目录路径（可选）
         graphify: 是否先运行 graphify 构建项目知识图谱（需要 workdir）
-        review_only: 仅审查模式，跳过编码直接审查
     """
     if len(task) > MAX_PROMPT_LEN:
         return json.dumps({"error": f"任务过长: {len(task)} > {MAX_PROMPT_LEN}"})
@@ -504,7 +492,7 @@ async def trio_concerto(task: str, workdir: str | None = None, graphify: bool = 
     if graphify and not workdir:
         return json.dumps({"error": "graphify=True 时需要指定 workdir"})
 
-    result = await trio_pipeline(task, workdir, graphify=graphify, review_only=review_only)
+    result = await trio_pipeline(task, workdir, graphify=graphify)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
