@@ -1,0 +1,34 @@
+# LiteLLM 代理配置 — Anthropic Messages API → DeepSeek
+# 运行: litellm --config /home/user/.hermes/litellm-config.yaml --port 53684
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  request_timeout: 120
+  num_retries: 2
+
+router_settings:
+  routing_strategy: "latency-based-routing"
+  enable_pre_call_checks: true
+  num_retries: 2
+  request_timeout: 120
+  allowed_fails: 3
+  cooldown_time: 30
+
+model_list:
+  - model_name: claude-sonnet-4-7
+    litellm_params:
+      model: openai/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com/v1
+      rpm: 500
+    model_info:
+      mode: chat
+      supports_function_calling: true
+
+  - model_name: deepseek-chat
+    litellm_params:
+      model: openai/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com/v1
+      rpm: 500
