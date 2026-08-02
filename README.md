@@ -1,138 +1,140 @@
-<div align="center">
-<h1>三体协奏 — Trio Concerto</h1>
-<p><b>三 agent 流水线：CC 思考分析 → OpenCode 编码实现 → Codex 审核验证</b></p>
-<p>Hermes 调度，三体协同，循环修正</p>
-</div>
+# Trio Concerto — 三体协奏：多 Agent 协同编码编排框架
+
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
+**三体协奏（Trio Concerto）** 是一个多 Agent 协同编码编排框架——用 **CC (Claude Code) → OpenCode → Codex** 三个 AI 编码 Agent 组成"设计 → 编码 → 审核"的完整研发流水线，通过一个轻量 HTTP 编排层（ACP Bridge）统一调度。
+
+> 名字来源：三个 Agent 像三体运动一样相互制衡、缺一不可——CC 审设计、OpenCode 写代码、Codex 查问题，形成闭环。
 
 ---
 
-## 架构
+## 🏗️ 架构
 
 ```
-用户任务
-    │
-    ▼  [可选] graphify 图谱化
-    │
-    ▼  [自动] LiteLLM (:53684) — CC 协议转换代理
-    │
-    ▼  [Stage 1] CC 思考分析       → 架构方案
-    │
-    ▼  [Stage 2] OpenCode 编码实现  → 代码（落地 .trio_code_output.py）
-    │
-    ▼  [Stage 3] Codex 审核验证     → 审查意见
-    │
-    └── 不通过 → 循环修正（带上轮代码，最多 3 轮）
-         └── 通过 → 最终输出
+┌─────────────────────────────────────────────────────────┐
+│  调用方（Hermes / 任意 HTTP 客户端）                     │
+│    │ POST /dispatch → ACP Bridge (:8770)                │
+│    │ GET /tasks/:id（实时心跳 progress）                 │
+├─────────────────────────────────────────────────────────┤
+│  工具层: MCP shm-tools (mcp_server.py)                  │
+│    read_file / search_files / terminal / get_project_info│
+├─────────────────────────────────────────────────────────┤
+│  模型层: opencodex (:10100) → DeepSeek v4-flash          │
+│    （统一 Responses API 代理，三 Agent 共享）            │
+├─────────────┬───────────────┬───────────────────────────┤
+│  CC          │  OpenCode      │  Codex                    │
+│  claude -p   │  opencode run  │  codex exec               │
+│  idle 180s   │  idle 120s     │  idle 120s                │
+│  并发 2      │  并发 3        │  并发 3 (与OC共享sem)     │
+└─────────────┴───────────────┴───────────────────────────┘
 ```
 
-三个 agent 共享同一个后端模型（DeepSeek V4 Flash），通过不同的 prompt 和工具行为实现分工协作。
+### 三层协议分工
 
-## 快速开始
+| 层 | 组件 | 协议 | 职责 |
+|:---|:-----|:-----|:-----|
+| **编排层** | acp_bridge.py (:8770) | HTTP + subprocess | 任务派发、双超时、熔断、心跳、结果收集 |
+| **工具层** | mcp_server.py | MCP (stdio) | 文件读取、搜索、终端执行，三 Agent 共享 |
+| **模型层** | opencodex (:10100) | Responses API 代理 | 统一 DeepSeek/Claude/Gemini 等后端 |
 
-### 前提条件
+## 🔄 标准工作流
 
-| 依赖 | 版本要求 | 安装方式 |
-|------|---------|---------|
-| Node.js | >= 22 | `nvm install 24` |
-| Python | >= 3.10 | 系统自带 |
-| Hermes Agent | — | [Hermes](https://hermes-agent.nousresearch.com) |
-| DeepSeek API Key | — | `export DEEPSEEK_API_KEY="sk-..."` |
+```
+1. 设计（Phase 1）:  CC 审查设计 → 发现设计问题先修
+2. 编码（Phase 2）:  OpenCode 实现（基于 CC 评审结果手术式修改）
+3. 审核（Phase 3）:  Codex 验证（可多轮，直到输出"最终通过"）
+4. 本机验证:         pytest 全量 + 语法检查
+5. 提交:             git commit（三段式：根因→修复→验证）
+```
 
-### 一键部署
+## 🚀 快速开始
+
+### 依赖
+
+- Python 3.10+
+- [opencodex](https://github.com/bitkyc08/opencodex)（模型层代理，可选——也可直接配 DeepSeek/其他）
+- Claude Code CLI、OpenCode CLI、Codex CLI（三个 Agent）
+
+### 安装
 
 ```bash
-git clone https://github.com/Neocher/三体协奏.git
-cd 三体协奏
-bash setup.sh
+git clone https://github.com/<you>/trio-concerto.git
+cd trio-concerto
+pip install -r requirements.txt
 ```
 
-### 手动安装
+### 配置（环境变量）
 
-```bash
-# 1. 三路 agent
-npm install -g @openai/codex @anthropic-ai/claude-code oh-my-opencode-slim
-
-# 2. Python 依赖
-pip install 'mcp>=2.0.0' litellm graphifyy
-
-# 3. 复制 litellm 配置
-mkdir -p ~/.hermes
-cp litellm-config.yaml ~/.hermes/
-
-# 4. 注册 Hermes MCP
-hermes mcp add trio-concerto --command mcp --args run $(pwd)/trio-concerto.py
-```
-
-### 配置
-
-**Claude Code → LiteLLM** (`~/.claude/settings.json`):
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:53684",
-    "ANTHROPIC_API_KEY": "sk-...",
-    "ANTHROPIC_MODEL": "claude-sonnet-4-7"
-  }
-}
-```
-
-**Codex → responses2chat** (`~/.codex/config.toml`):
-```toml
-model = "deepseek-v4-flash"
-[model_providers.deepseek]
-name = "DeepSeek"
-base_url = "http://127.0.0.1:53683/v1"
-wire_api = "responses"
-```
+| 变量 | 默认值 | 说明 |
+|:-----|:-------|:-----|
+| `SHM_WORKDIR` | 当前文件目录 | Agent 工作目录（放你的项目）|
+| `OPENCODE_BIN` | `~/.hermes/node/bin/opencode` | OpenCode 二进制路径 |
+| `ACP_TOKEN` | 空（不认证）| Bearer 认证 token |
+| `SHM_AGENT_TOTAL_TIMEOUT` | 900 | 总超时（秒）|
+| `SHM_AGENT_IDLE_TIMEOUT` | 120 | 空闲超时（秒），CC 建议 180 |
+| `SHM_AGENT_CC_CONCURRENCY` | 2 | CC 并发 |
+| `SHM_AGENT_OC_CONCURRENCY` | 3 | OpenCode 并发 |
+| `SHM_AGENT_CODEX_CONCURRENCY` | 3 | Codex 并发 |
 
 ### 启动
 
 ```bash
-# 1. 启动 responses2chat 协议转换代理（Codex 依赖）
-python3 responses2chat.py --port 53683 &
+# 模型层（如用 opencodex）
+ocx config set defaultProvider deepseek
+ocx start --port 10100
 
-# 2. 直接调用三体协奏
-trio_concerto(task="实现一个函数", workdir="/path/to/project")
-
-# 或带 graphify 知识图谱
-trio_concerto(task="重构用户模块", workdir="/path", graphify=True)
+# 编排层
+python3 acp_bridge.py
 ```
 
-LiteLLM 会在 trio-concerto 内部自动启动。
+### 使用
 
-## API
+```bash
+# 派发任务
+curl -X POST http://127.0.0.1:8770/dispatch \
+  -H "Content-Type: application/json" \
+  -d '{"target_agent":"opencode","prompt":"重构 xxx 模块"}'
 
-### `trio_concerto(task, workdir, graphify)`
+# 查询任务（含心跳 progress）
+curl http://127.0.0.1:8770/tasks/<task_id>
+```
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|:----:|------|
-| `task` | str | ✅ | 任务描述 |
-| `workdir` | str | ❌ | 工作目录 |
-| `graphify` | bool | ❌ | 是否先构建知识图谱 |
+## 📡 API
 
-### `trio_status()`
+| 方法 | 端点 | 说明 |
+|:-----|:-----|:-----|
+| GET | `/health` | 摘要 + 熔断状态 |
+| GET | `/agents` | 各 Agent 健康详表 |
+| POST | `/dispatch` | 派发任务 `{target_agent, prompt}` |
+| GET | `/tasks/:id` | 任务状态 + 心跳 progress |
+| POST | `/reset/:agent` | 手工恢复熔断 |
 
-返回当前三路 agent 的状态和流水线信息。
+## 🛡️ 韧性特性
 
-## 评估结果
+| 能力 | 说明 |
+|:-----|:-----|
+| 流式读取 | 4KB 块读 + 有界队列(64) + 三路汇合，实时心跳 |
+| 双超时 | 总超时 900s（防死锁）+ 空闲超时 120/180s（判卡死）|
+| 进程组击杀 | 超时 kill 整个进程树，不留僵尸 |
+| 熔断 + 半开 | 连续 3 次失败 → degraded → 60s 后半开探测 |
+| 内存防护 | 输出 5MB 上限 + 截断 100KB + in-flight ≤ 20 |
+| 认证 | 可选 Bearer token（`ACP_TOKEN`）|
+| 任务清理 | 每 5 分钟清理 > 30 分钟任务 |
 
-简单函数（read_csv_safe）实测：
+## 📂 目录
 
-| 维度 | 单 Agent | 三体协奏 |
-|------|:--------:|:--------:|
-| 耗时 | 66s | 190s（含 2 轮修正） |
-| FileNotFoundError | ❌ | ✅ |
-| 编码回退 | ✅ | ✅ |
-| 异常类型保留 | ❌ | ✅ |
+```
+trio-concerto/
+├── acp_bridge.py      # 编排层（核心）
+├── mcp_server.py      # 工具层（MCP 服务器）
+├── requirements.txt
+├── docs/
+│   └── architecture.md   # 架构详解
+├── scripts/
+│   └── dispatch.sh       # 派发示例脚本
+└── README.md
+```
 
-三体协奏的价值在于 CC 的架构分析 + Codex 的审查循环，适合代码库级重构和严谨场景。简单任务建议直接用单 agent。
+## 📜 License
 
-## 已知问题
-
-1. **responses2chat 不自启** — Codex 阶段依赖 :53683，需手动启动
-2. **总耗时较长** — 3 阶段 + 修正轮次 = 3~5 分钟
-3. **依赖 DeepSeek** — 若需更换模型需改多处配置
-
-## 许可
-
-MIT
+Apache-2.0 © 2026
