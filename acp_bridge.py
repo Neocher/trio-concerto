@@ -354,10 +354,38 @@ async def _exec_stream(agent: str, prompt: str, cwd: str, cfg: dict,
                 q.task_done()
 
     async def _idle_watchdog() -> None:
-        """空闲超时监控：无新输出字节超过 idle_timeout 即触发。"""
+        """空闲超时监控：无输出字节 + 进程 CPU 无活动 超过 idle_timeout 才触发。
+
+        【FIX 2026-08-02】用户原则：心跳在运行就不该中断。
+        之前仅按输出字节判空闲——CC 长思考（读文件→内部推理→一次性输出）
+        在思考阶段无 stdout，但 CPU 活跃（正常工作中），被误判 idle 杀掉。
+        现在：进程 CPU 有活动（/proc/PID/stat utime+stime 变化）= 在思考 = 重置 idle；
+        只有「进程存活 + CPU 完全空闲 + 无输出 > idle_timeout」才判真空闲。
+        """
+        def _proc_cpu_time() -> tuple[int, int]:
+            try:
+                with open(f"/proc/{proc.pid}/stat", "rb") as f:
+                    parts = f.read().split()
+                # 字段 14=utime, 15=stime（0 基索引 13,14）
+                return int(parts[13]), int(parts[14])
+            except (OSError, ValueError, IndexError):
+                return 0, 0
+
+        nonlocal last_activity  # 引用外层 _exec_stream 的 last_activity（_read_stream 也用它）
+        last_cpu = _proc_cpu_time()
         while True:
             await asyncio.sleep(5)
             if time.time() - last_activity > idle_timeout:
+                cpu_now = _proc_cpu_time()
+                # 进程已退出：无 CPU 变化，视为可回收（正常退出由 reader EOF 处理）
+                if proc.returncode is not None:
+                    return
+                # CPU 有活动 = 进程在思考/计算，重置 idle 计时
+                if cpu_now != last_cpu:
+                    last_activity = time.time()
+                    last_cpu = cpu_now
+                    continue
+                # 进程存活但 CPU 完全空闲且无输出超时 → 真空闲
                 return
 
     # ── 启动子任务 ──
