@@ -137,6 +137,8 @@ MAX_OUTPUT_BUFFER = 5 * 1024 * 1024   # H2: reader 侧输出累计上限（5MB�
 MAX_FULL_PROMPT = 50 * 1024           # M2: full_prompt（context+prompt）整体上限（50KB）
 IDLE_TERM_GRACE = 10                  # M1: idle 触发后 SIGTERM 宽限期（秒），宽限后未退再 SIGKILL
 HALF_OPEN_WINDOW = 60                 # H1: 熔断半开窗口（秒），degraded 60s 后放行 1 个探测任务
+TOTAL_EXTENSION_SECONDS = 300         # FIX: total 到点但进程活跃时的顺延时长（秒）
+MAX_TOTAL_EXTENSIONS = 3              # FIX: total 最大顺延次数（900+3×300=1800s 上限，防失控）
 
 # ── Data ──
 
@@ -297,6 +299,16 @@ async def _exec_stream(agent: str, prompt: str, cwd: str, cfg: dict,
     err_parts: list[bytes] = []
     last_activity = time.time()  # 空闲判据：按字节流，非按行
 
+    # 【FIX 2026-08-02】共享 CPU 活跃检测：idle_watchdog + total_watchdog 共用
+    def _proc_cpu_time() -> tuple[int, int]:
+        """读取 /proc/PID/stat 的 utime+stime（0 基索引 13,14），失败返回 (0,0)。"""
+        try:
+            with open(f"/proc/{proc.pid}/stat", "rb") as f:
+                parts = f.read().split()
+            return int(parts[13]), int(parts[14])
+        except (OSError, ValueError, IndexError):
+            return 0, 0
+
     async def _feed_stdin() -> None:
         """显式喂 stdin → drain → close（exec_cc 必需：claude -p - 从 stdin 读 prompt）"""
         try:
@@ -362,15 +374,6 @@ async def _exec_stream(agent: str, prompt: str, cwd: str, cfg: dict,
         现在：进程 CPU 有活动（/proc/PID/stat utime+stime 变化）= 在思考 = 重置 idle；
         只有「进程存活 + CPU 完全空闲 + 无输出 > idle_timeout」才判真空闲。
         """
-        def _proc_cpu_time() -> tuple[int, int]:
-            try:
-                with open(f"/proc/{proc.pid}/stat", "rb") as f:
-                    parts = f.read().split()
-                # 字段 14=utime, 15=stime（0 基索引 13,14）
-                return int(parts[13]), int(parts[14])
-            except (OSError, ValueError, IndexError):
-                return 0, 0
-
         nonlocal last_activity  # 引用外层 _exec_stream 的 last_activity（_read_stream 也用它）
         last_cpu = _proc_cpu_time()
         while True:
@@ -388,6 +391,45 @@ async def _exec_stream(agent: str, prompt: str, cwd: str, cfg: dict,
                 # 进程存活但 CPU 完全空闲且无输出超时 → 真空闲
                 return
 
+    async def _total_watchdog() -> None:
+        """总超时监控：活跃感知，到点不硬杀。
+
+        【FIX 2026-08-02】用户原则：心跳在运行就不该中断。
+        之前是纯 asyncio.sleep(total_timeout) 定时炸弹——长任务（如 A 组
+        H3/H4/H5 三问题一次做）900s 一直在真实工作，只是任务重超过预算，
+        被无差别 SIGKILL（rc=-9），最后阶段的工作全部丢失。
+        现在：total_timeout 到点后检查进程 CPU——
+          - 进程活跃（CPU 有变化）= 仍在真实工作 → 顺延 TOTAL_EXTENSION_SECONDS
+          - 顺延次数达到 MAX_TOTAL_EXTENSIONS 上限 → 触发（防失控无限运行）
+          - 进程空闲（CPU 无变化 + 无输出）且到点 → 真正触发 total_timeout
+        """
+        nonlocal last_activity
+        extensions = 0
+        deadline = time.time() + total_timeout
+        last_cpu = _proc_cpu_time()
+        while True:
+            await asyncio.sleep(5)
+            if time.time() < deadline:
+                continue
+            # 到点：检查活跃度
+            if proc.returncode is not None:
+                return  # 进程已退出，交给 reader EOF 正常收尸
+            cpu_now = _proc_cpu_time()
+            active = (cpu_now != last_cpu) or (time.time() - last_activity < idle_timeout * 0.5)
+            if active:
+                if extensions >= MAX_TOTAL_EXTENSIONS:
+                    return  # 顺延次数用尽，触发 total_timeout（防失控）
+                extensions += 1
+                deadline = time.time() + TOTAL_EXTENSION_SECONDS
+                logger.warning(
+                    "[%s] TOTAL deadline reached but process active — extending +%ds (ext %d/%d)",
+                    agent, TOTAL_EXTENSION_SECONDS, extensions, MAX_TOTAL_EXTENSIONS,
+                )
+                last_cpu = cpu_now
+                continue
+            # 进程空闲且到点 → 真正 total_timeout
+            return
+
     # ── 启动子任务 ──
     feed_task = asyncio.ensure_future(_feed_stdin()) if feed_stdin else None
     r1 = asyncio.ensure_future(_read_stream(proc.stdout, out_parts))
@@ -395,7 +437,7 @@ async def _exec_stream(agent: str, prompt: str, cwd: str, cfg: dict,
     reader_task = asyncio.ensure_future(asyncio.gather(r1, r2))
     consumer = asyncio.ensure_future(_consume())
     idle_task = asyncio.ensure_future(_idle_watchdog())
-    total_task = asyncio.ensure_future(asyncio.sleep(total_timeout))
+    total_task = asyncio.ensure_future(_total_watchdog())
 
     # ── 三路汇合（超时判定只在此层）──
     reason = ""
