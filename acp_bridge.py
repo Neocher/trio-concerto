@@ -137,8 +137,6 @@ MAX_OUTPUT_BUFFER = 5 * 1024 * 1024   # H2: reader 侧输出累计上限（5MB�
 MAX_FULL_PROMPT = 50 * 1024           # M2: full_prompt（context+prompt）整体上限（50KB）
 IDLE_TERM_GRACE = 10                  # M1: idle 触发后 SIGTERM 宽限期（秒），宽限后未退再 SIGKILL
 HALF_OPEN_WINDOW = 60                 # H1: 熔断半开窗口（秒），degraded 60s 后放行 1 个探测任务
-TOTAL_EXTENSION_SECONDS = 300         # FIX: total 到点但进程活跃时的顺延时长（秒）
-MAX_TOTAL_EXTENSIONS = 3              # FIX: total 最大顺延次数（900+3×300=1800s 上限，防失控）
 
 # ── Data ──
 
@@ -394,17 +392,17 @@ async def _exec_stream(agent: str, prompt: str, cwd: str, cfg: dict,
     async def _total_watchdog() -> None:
         """总超时监控：活跃感知，到点不硬杀。
 
-        【FIX 2026-08-02】用户原则：心跳在运行就不该中断。
+        【FIX 2026-08-02】用户原则：CPU 活跃还在运行就不杀，除非空闲才杀。
         之前是纯 asyncio.sleep(total_timeout) 定时炸弹——长任务（如 A 组
         H3/H4/H5 三问题一次做）900s 一直在真实工作，只是任务重超过预算，
         被无差别 SIGKILL（rc=-9），最后阶段的工作全部丢失。
-        现在：total_timeout 到点后检查进程 CPU——
-          - 进程活跃（CPU 有变化）= 仍在真实工作 → 顺延 TOTAL_EXTENSION_SECONDS
-          - 顺延次数达到 MAX_TOTAL_EXTENSIONS 上限 → 触发（防失控无限运行）
-          - 进程空闲（CPU 无变化 + 无输出）且到点 → 真正触发 total_timeout
+        v2 修复（2026-08-03 用户确认原则）：total_timeout 只是「空闲兜底」——
+          - 进程 CPU 活跃（/proc/PID/stat 变化）= 仍在真实工作 → 重置 deadline，永不杀
+          - 进程存活 + CPU 完全空闲 + 无输出 持续 total_timeout → 真失控 → 触发
+        与 _idle_watchdog 同判据，只是阈值更大（900s vs 180s）：idle 先杀真空闲，
+        total 兜底「idle 没抓到的长空闲」。不再有顺延次数上限——活跃任务无限期运行。
         """
         nonlocal last_activity
-        extensions = 0
         deadline = time.time() + total_timeout
         last_cpu = _proc_cpu_time()
         while True:
@@ -417,17 +415,15 @@ async def _exec_stream(agent: str, prompt: str, cwd: str, cfg: dict,
             cpu_now = _proc_cpu_time()
             active = (cpu_now != last_cpu) or (time.time() - last_activity < idle_timeout * 0.5)
             if active:
-                if extensions >= MAX_TOTAL_EXTENSIONS:
-                    return  # 顺延次数用尽，触发 total_timeout（防失控）
-                extensions += 1
-                deadline = time.time() + TOTAL_EXTENSION_SECONDS
+                # 进程仍在真实工作 → 重置 deadline（活跃任务无限顺延，不杀）
+                deadline = time.time() + total_timeout
                 logger.warning(
-                    "[%s] TOTAL deadline reached but process active — extending +%ds (ext %d/%d)",
-                    agent, TOTAL_EXTENSION_SECONDS, extensions, MAX_TOTAL_EXTENSIONS,
+                    "[%s] TOTAL deadline reached but process active — resetting deadline +%ds",
+                    agent, total_timeout,
                 )
                 last_cpu = cpu_now
                 continue
-            # 进程空闲且到点 → 真正 total_timeout
+            # 进程存活但 CPU 完全空闲 + 无输出持续 total_timeout → 真失控
             return
 
     # ── 启动子任务 ──
