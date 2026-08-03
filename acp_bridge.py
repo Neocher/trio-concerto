@@ -83,7 +83,19 @@ ACP_TOKEN = _SecretStr(os.environ.get("ACP_TOKEN", ""))
 _WORKDIR = os.environ.get("SHM_WORKDIR", os.path.dirname(os.path.abspath(__file__)))
 
 # OpenCode 二进制路径：环境变量可配
-_OPENCODE_BIN = os.environ.get("OPENCODE_BIN", os.path.expanduser("~/.hermes/node/bin/opencode"))
+def _resolve_opencode_bin() -> str:
+    """解析 opencode 二进制：环境变量 > PATH 探测 > 默认路径"""
+    env = os.environ.get("OPENCODE_BIN")
+    if env:
+        return env
+    import shutil
+    found = shutil.which("opencode")
+    if found:
+        return found
+    return os.path.expanduser("~/.hermes/node/bin/opencode")
+
+
+_OPENCODE_BIN = _resolve_opencode_bin()
 
 
 @app.middleware("http")
