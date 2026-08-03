@@ -125,8 +125,9 @@ curl http://127.0.0.1:8770/tasks/<task_id>
 
 ```
 trio-concerto/
-├── acp_bridge.py      # 编排层（核心）
-├── mcp_server.py      # 工具层（MCP 服务器）
+├── acp_bridge.py        # 编排层（核心）
+├── mcp_server.py        # 工具层（MCP 服务器）
+├── mcp_orchestrator.py  # MCP 编排适配层（Hermes 入口：三阶段流水线 → HTTP 编排）
 ├── requirements.txt
 ├── docs/
 │   └── architecture.md   # 架构详解
@@ -134,6 +135,20 @@ trio-concerto/
 │   └── dispatch.sh       # 派发示例脚本
 └── README.md
 ```
+
+## 🤝 MCP 编排入口（mcp_orchestrator.py）
+
+Hermes（或任意 MCP 客户端）通过 `mcp_orchestrator.py` 调用**完整三阶段流水线**，
+内部经 acp_bridge HTTP 编排：CC 思考分析 → OpenCode 编码实现 → Codex 审核验证
+（不合格循环修正，最多 3 轮；CC 失败自动 OpenCode 兜底）。
+
+```bash
+hermes mcp add trio-concerto --command mcp --args run /home/user/trio-concerto/mcp_orchestrator.py
+```
+
+工具：`trio_concerto(task, workdir, graphify)` 提交（立即返回 task_id）→
+`trio_result(task_id)` 轮询进度/结果 → `trio_list()` 全部任务 → `trio_status()`
+各 agent 健康。依赖 `acp_bridge` 运行于 :8770（可用环境变量 `TRIO_BRIDGE` 覆盖）。
 
 ## 📜 License
 
